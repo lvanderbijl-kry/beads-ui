@@ -167,22 +167,25 @@ export function createEpicsView(
       expanded.add(epic_id);
       loading.add(epic_id);
       doRender();
-      // Subscribe to epic detail; children are rendered from `dependents`
+      // Subscribe to the epic's children list (bd children <id> --json)
       if (subscriptions && typeof subscriptions.subscribeList === 'function') {
         try {
           // Register store first to avoid dropping the initial snapshot
           try {
             if (issue_stores && /** @type {any} */ (issue_stores).register) {
-              /** @type {any} */ (issue_stores).register(`detail:${epic_id}`, {
-                type: 'issue-detail',
-                params: { id: epic_id }
-              });
+              /** @type {any} */ (issue_stores).register(
+                `children:${epic_id}`,
+                {
+                  type: 'epic-children',
+                  params: { id: epic_id }
+                }
+              );
             }
           } catch {
             // ignore
           }
-          const u = await subscriptions.subscribeList(`detail:${epic_id}`, {
-            type: 'issue-detail',
+          const u = await subscriptions.subscribeList(`children:${epic_id}`, {
+            type: 'epic-children',
             params: { id: epic_id }
           });
           epic_unsubs.set(epic_id, u);
@@ -207,7 +210,9 @@ export function createEpicsView(
         epic_unsubs.delete(epic_id);
         try {
           if (issue_stores && /** @type {any} */ (issue_stores).unregister) {
-            /** @type {any} */ (issue_stores).unregister(`detail:${epic_id}`);
+            /** @type {any} */ (issue_stores).unregister(
+              `children:${epic_id}`
+            );
           }
         } catch {
           // ignore
