@@ -176,32 +176,26 @@ describe('list-selectors', () => {
     expect(closed).toEqual(['C2', 'C1', 'C3']);
   });
 
-  test('selectEpicChildren uses detail:{id} dependents and list sorting (priority→created asc)', async () => {
+  test('selectEpicChildren uses children:{id} snapshot and list sorting (priority→created asc)', async () => {
     const { issueStores, selectors } = setup();
-    issueStores.getStore('detail:42').applyPush({
+    issueStores.getStore('children:42').applyPush({
       type: 'snapshot',
-      id: 'detail:42',
+      id: 'children:42',
       revision: 1,
       issues: [
         {
-          id: '42',
-          issue_type: 'epic',
-          dependents: [
-            {
-              id: 'E1',
-              priority: 1,
-              created_at: 10_000,
-              updated_at: 10_000,
-              closed_at: null
-            },
-            {
-              id: 'E2',
-              priority: 1,
-              created_at: 9_000,
-              updated_at: 9_000,
-              closed_at: null
-            }
-          ]
+          id: 'E1',
+          priority: 1,
+          created_at: 10_000,
+          updated_at: 10_000,
+          closed_at: null
+        },
+        {
+          id: 'E2',
+          priority: 1,
+          created_at: 9_000,
+          updated_at: 9_000,
+          closed_at: null
         }
       ]
     });

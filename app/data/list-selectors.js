@@ -69,15 +69,13 @@ export function createListSelectors(issue_stores = undefined) {
     if (!issue_stores || typeof issue_stores.snapshotFor !== 'function') {
       return [];
     }
-    // Epic detail subscription uses client id `detail:<id>` and contains the
-    // epic entity with a `dependents` array. Render children from that list.
+    // Children subscription uses client id `children:<id>` and contains the
+    // list of issues whose parent is this epic (via `bd children <id> --json`).
     const arr = /** @type {any[]} */ (
-      issue_stores.snapshotFor(`detail:${epic_id}`) || []
+      issue_stores.snapshotFor(`children:${epic_id}`) || []
     );
-    const epic = arr.find((it) => String(it?.id || '') === String(epic_id));
-    const dependents = Array.isArray(epic?.dependents) ? epic.dependents : [];
     return /** @type {IssueLite[]} */ (
-      dependents.slice().sort(cmpPriorityThenCreated)
+      arr.slice().sort(cmpPriorityThenCreated)
     );
   }
 
