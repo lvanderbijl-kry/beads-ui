@@ -60,11 +60,22 @@ export function createApp(config) {
     res.status(200).json({ ok: true, workspaces });
   });
 
-  if (
-    !fs.statSync(path.resolve(config.app_dir, 'main.bundle.js'), {
-      throwIfNoEntry: false
-    })
-  ) {
+  // Use on-demand esbuild when either:
+  //   1) there is no committed bundle on disk (fresh checkout), OR
+  //   2) we appear to be running from a source checkout (`app/main.js` is
+  //      present — packaged installs only ship `main.bundle.js`).
+  // The second condition prevents stale-bundle footguns during development:
+  // running `npm start` after editing source no longer serves the previous
+  // build just because `app/main.bundle.js` happens to exist from an earlier
+  // `npm run build` or `npm pack`.
+  const has_bundle = !!fs.statSync(
+    path.resolve(config.app_dir, 'main.bundle.js'),
+    { throwIfNoEntry: false }
+  );
+  const has_source = !!fs.statSync(path.resolve(config.app_dir, 'main.js'), {
+    throwIfNoEntry: false
+  });
+  if (!has_bundle || has_source) {
     /**
      * On-demand bundle for the browser using esbuild.
      *
