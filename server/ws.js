@@ -7,12 +7,24 @@ import path from 'node:path';
 import { WebSocketServer } from 'ws';
 import { isRequest, makeError, makeOk } from '../app/protocol.js';
 import { getGitUserName, runBd, runBdJson } from './bd.js';
+import { loadAndEnumerate } from './city-toml.js';
 import { resolveWorkspaceDatabase } from './db.js';
-import { fetchListForSubscription } from './list-adapters.js';
+import {
+  fetchListForActiveWorkspaces,
+  tagItemsWithWorkspace
+} from './list-adapters.js';
 import { debug } from './logging.js';
 import { getAvailableWorkspaces } from './registry-watcher.js';
+import {
+  addCity,
+  addWorkspace,
+  loadSettings,
+  removeCity,
+  removeWorkspace
+} from './settings-store.js';
 import { keyOf, registry } from './subscriptions.js';
 import { validateSubscribeListPayload } from './validators.js';
+import { resolveWorkspaces } from './workspace-registry.js';
 
 const log = debug('ws');
 
@@ -203,6 +215,94 @@ let CURRENT_WORKSPACE = null;
 let DB_WATCHER = null;
 
 /**
+ * Resolve the cwd a mutation should run in. Preference order:
+ *   1) `payload.workspace` (absolute path) when supplied by the client and
+ *      resolves to a known workspace.
+ *   2) `payload._workspace.path` (echoed from a list item).
+ *   3) CURRENT_WORKSPACE.root_dir as the default for legacy single-workspace
+ *      clients.
+ *
+ * @param {unknown} payload
+ * @returns {string | undefined}
+ */
+function resolveMutationCwd(payload) {
+  const p = /** @type {any} */ (payload) || {};
+  if (typeof p.workspace === 'string' && p.workspace.length > 0) {
+    return p.workspace;
+  }
+  if (p._workspace && typeof p._workspace.path === 'string') {
+    return p._workspace.path;
+  }
+  return CURRENT_WORKSPACE?.root_dir;
+}
+
+/**
+ * Tag the result of `bd show --json` with the workspace it came from so the
+ * client can keep follow-up edits routed back to the same workspace.
+ *
+ * @param {unknown} shown
+ * @param {string | undefined} cwd
+ * @returns {unknown}
+ */
+function tagShownIssue(shown, cwd) {
+  if (!shown || typeof shown !== 'object' || Array.isArray(shown)) {
+    return shown;
+  }
+  const resolved_cwd = cwd || CURRENT_WORKSPACE?.root_dir;
+  if (!resolved_cwd) return shown;
+  const { workspaces } = resolveWorkspaces({
+    cwd: CURRENT_WORKSPACE?.root_dir
+  });
+  const ws_entry = workspaces.find((w) => w.path === resolved_cwd) || null;
+  if (!ws_entry) return shown;
+  tagItemsWithWorkspace(
+    [/** @type {Record<string, unknown> & { id: string }} */ (shown)],
+    ws_entry
+  );
+  return shown;
+}
+
+/**
+ * Broadcast warnings about workspaces whose `bd` call failed. Sent as a fire-
+ * and-forget event so the UI can surface them per workspace.
+ *
+ * @param {Array<{ workspace: { path: string, label: string }, ok: boolean, error?: { code: string, message: string } }>} results
+ */
+function publishWorkspaceWarnings(results) {
+  if (!Array.isArray(results) || results.length === 0) return;
+  /** @type {Array<{ path: string, label: string, code: string, message: string }>} */
+  const warnings = [];
+  for (const r of results) {
+    if (!r.ok) {
+      warnings.push({
+        path: r.workspace.path,
+        label: r.workspace.label,
+        code: r.error?.code || 'bd_error',
+        message: r.error?.message || 'bd failed'
+      });
+    }
+  }
+  if (warnings.length === 0) return;
+  const wss = CURRENT_WSS;
+  if (!wss) return;
+  const msg = JSON.stringify({
+    id: `evt-${Date.now()}`,
+    ok: true,
+    type: 'workspace-warnings',
+    payload: { warnings }
+  });
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN) {
+      try {
+        ws.send(msg);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
  * Get or initialize the subscription state for a socket.
  *
  * @param {WebSocket} ws
@@ -337,14 +437,11 @@ function emitSubscriptionDelete(ws, client_id, key, issue_id) {
 async function refreshAndPublish(spec) {
   const key = keyOf(spec);
   await registry.withKeyLock(key, async () => {
-    const res = await fetchListForSubscription(spec, {
+    const fanout = await fetchListForActiveWorkspaces(spec, {
       cwd: CURRENT_WORKSPACE?.root_dir
     });
-    if (!res.ok) {
-      log('refresh failed for %s: %s %o', key, res.error.message, res.error);
-      return;
-    }
-    const items = applyClosedIssuesFilter(spec, res.items);
+    publishWorkspaceWarnings(fanout.results);
+    const items = applyClosedIssuesFilter(spec, fanout.items);
     const prev_size = registry.get(key)?.itemsById.size || 0;
     const delta = registry.applyItems(key, items);
     const entry = registry.get(key);
@@ -632,10 +729,10 @@ export async function handleMessage(ws, data) {
       ws.send(JSON.stringify(makeError(req, code, message, details)));
     };
 
-    /** @type {Awaited<ReturnType<typeof fetchListForSubscription>> | null} */
+    /** @type {Awaited<ReturnType<typeof fetchListForActiveWorkspaces>> | null} */
     let initial = null;
     try {
-      initial = await fetchListForSubscription(spec, {
+      initial = await fetchListForActiveWorkspaces(spec, {
         cwd: CURRENT_WORKSPACE?.root_dir
       });
     } catch (err) {
@@ -646,15 +743,18 @@ export async function handleMessage(ws, data) {
       return;
     }
 
-    if (!initial.ok) {
-      log(
-        'initial snapshot failed for %s: %s %o',
-        key,
-        initial.error.message,
-        initial.error
-      );
-      const details = { ...(initial.error.details || {}), key };
-      replyWithError(initial.error.code, initial.error.message, details);
+    publishWorkspaceWarnings(initial.results);
+
+    // When every workspace failed, surface that as an error reply so the
+    // client can show a fatal error rather than rendering empty silently.
+    if (initial.results.length > 0 && initial.results.every((r) => !r.ok)) {
+      const first = /** @type {any} */ (initial.results[0]);
+      const code = first?.error?.code || 'bd_error';
+      const message = first?.error?.message || 'bd failed';
+      replyWithError(code, message, {
+        ...(first?.error?.details || {}),
+        key
+      });
       return;
     }
 
@@ -749,21 +849,22 @@ export async function handleMessage(ws, data) {
       return;
     }
     // Pass empty string to clear assignee when requested
-    const res = await runBd(['update', id, '--assignee', assignee]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['update', id, '--assignee', assignee], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -794,21 +895,22 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['update', id, '--status', status]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['update', id, '--status', status], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     // After mutation, refresh active subscriptions once (watcher or timeout)
     try {
       triggerMutationRefreshOnce();
@@ -840,21 +942,24 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['update', id, '--priority', String(priority)]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['update', id, '--priority', String(priority)], {
+      cwd
+    });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -904,21 +1009,22 @@ export async function handleMessage(ws, data) {
             : field === 'notes'
               ? '--notes'
               : '--design';
-    const res = await runBd(['update', id, flag, value]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['update', id, flag, value], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -930,9 +1036,8 @@ export async function handleMessage(ws, data) {
   // create-issue
   if (req.type === 'create-issue') {
     log('create-issue');
-    const { title, type, priority, description } = /** @type {any} */ (
-      req.payload || {}
-    );
+    const payload = /** @type {any} */ (req.payload || {});
+    const { title, type, priority, description } = payload;
     if (typeof title !== 'string' || title.length === 0) {
       ws.send(
         JSON.stringify(
@@ -945,6 +1050,40 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
+    // When more than one workspace is active, the client MUST pick one.
+    const active = resolveWorkspaces({
+      cwd: CURRENT_WORKSPACE?.root_dir
+    }).workspaces;
+    if (active.length > 1) {
+      const explicit =
+        typeof payload.workspace === 'string' ? payload.workspace : '';
+      if (!explicit) {
+        ws.send(
+          JSON.stringify(
+            makeError(
+              req,
+              'workspace_required',
+              'Multiple workspaces are active; payload.workspace must be set'
+            )
+          )
+        );
+        return;
+      }
+      const known = active.some((w) => w.path === explicit);
+      if (!known) {
+        ws.send(
+          JSON.stringify(
+            makeError(
+              req,
+              'workspace_unknown',
+              `Workspace not in active set: ${explicit}`
+            )
+          )
+        );
+        return;
+      }
+    }
+    const cwd = resolveMutationCwd(req.payload);
     const args = ['create', title];
     if (
       typeof type === 'string' &&
@@ -962,7 +1101,7 @@ export async function handleMessage(ws, data) {
     if (typeof description === 'string' && description.length > 0) {
       args.push('-d', description);
     }
-    const res = await runBd(args);
+    const res = await runBd(args, { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -970,7 +1109,7 @@ export async function handleMessage(ws, data) {
       return;
     }
     // Reply with a minimal ack
-    ws.send(JSON.stringify(makeOk(req, { created: true })));
+    ws.send(JSON.stringify(makeOk(req, { created: true, workspace: cwd })));
     // Refresh active subscriptions once (watcher or timeout)
     try {
       triggerMutationRefreshOnce();
@@ -1000,7 +1139,8 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['dep', 'add', a, b]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['dep', 'add', a, b], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1008,14 +1148,14 @@ export async function handleMessage(ws, data) {
       return;
     }
     const id = typeof view_id === 'string' && view_id.length > 0 ? view_id : a;
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1044,7 +1184,8 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['dep', 'remove', a, b]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['dep', 'remove', a, b], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1052,14 +1193,14 @@ export async function handleMessage(ws, data) {
       return;
     }
     const id = typeof view_id === 'string' && view_id.length > 0 ? view_id : a;
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1088,21 +1229,22 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['label', 'add', id, label.trim()]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['label', 'add', id, label.trim()], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1131,21 +1273,22 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['label', 'remove', id, label.trim()]);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['label', 'remove', id, label.trim()], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], { cwd });
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, tagShownIssue(shown.stdoutJson, cwd))));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1165,7 +1308,8 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBdJson(['comments', id, '--json']);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBdJson(['comments', id, '--json'], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1197,14 +1341,15 @@ export async function handleMessage(ws, data) {
       return;
     }
 
+    const cwd = resolveMutationCwd(req.payload);
     // Get git user name for author attribution
-    const author = await getGitUserName();
+    const author = await getGitUserName({ cwd });
     const args = ['comment', id, text.trim()];
     if (author) {
       args.push('--author', author);
     }
 
-    const res = await runBd(args);
+    const res = await runBd(args, { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1213,7 +1358,7 @@ export async function handleMessage(ws, data) {
     }
 
     // Return updated comments list
-    const comments = await runBdJson(['comments', id, '--json']);
+    const comments = await runBdJson(['comments', id, '--json'], { cwd });
     if (comments.code !== 0) {
       ws.send(
         JSON.stringify(
@@ -1237,7 +1382,8 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['delete', id, '--force']);
+    const cwd = resolveMutationCwd(req.payload);
+    const res = await runBd(['delete', id, '--force'], { cwd });
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(
@@ -1246,7 +1392,7 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, { deleted: true, id })));
+    ws.send(JSON.stringify(makeOk(req, { deleted: true, id, workspace: cwd })));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1338,6 +1484,191 @@ export async function handleMessage(ws, data) {
     return;
   }
 
+  // list-workspaces-resolved: returns the merged workspace registry
+  // (cwd auto-discovery + settings + city.toml), with each workspace's source.
+  if (req.type === 'list-workspaces-resolved') {
+    log('list-workspaces-resolved');
+    const reg = resolveWorkspaces({ cwd: CURRENT_WORKSPACE?.root_dir });
+    ws.send(JSON.stringify(makeOk(req, reg)));
+    return;
+  }
+
+  // settings-get: returns the raw settings doc.
+  if (req.type === 'settings-get') {
+    log('settings-get');
+    try {
+      const settings = loadSettings();
+      ws.send(JSON.stringify(makeOk(req, settings)));
+    } catch (err) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'settings_error',
+            (err && /** @type {any} */ (err).message) ||
+              'Failed to load settings'
+          )
+        )
+      );
+    }
+    return;
+  }
+
+  // settings-add-workspace: payload { path: string, label?: string }
+  if (req.type === 'settings-add-workspace') {
+    const { path: wp, label } = /** @type {any} */ (req.payload || {});
+    if (typeof wp !== 'string' || wp.length === 0) {
+      ws.send(
+        JSON.stringify(
+          makeError(req, 'bad_request', 'payload requires { path: string }')
+        )
+      );
+      return;
+    }
+    try {
+      // Validate workspace directory exists and contains .beads/
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const abs = path.resolve(wp);
+      const beads = path.join(abs, '.beads');
+      if (!fs.existsSync(beads) || !fs.statSync(beads).isDirectory()) {
+        ws.send(
+          JSON.stringify(
+            makeError(
+              req,
+              'no_beads_dir',
+              `No .beads/ directory found under ${abs}`
+            )
+          )
+        );
+        return;
+      }
+      const settings = addWorkspace({ path: abs, label });
+      ws.send(JSON.stringify(makeOk(req, settings)));
+      broadcastWorkspacesUpdated();
+    } catch (err) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'settings_error',
+            (err && /** @type {any} */ (err).message) ||
+              'Failed to save settings'
+          )
+        )
+      );
+    }
+    return;
+  }
+
+  // settings-remove-workspace: payload { path: string }
+  if (req.type === 'settings-remove-workspace') {
+    const { path: wp } = /** @type {any} */ (req.payload || {});
+    if (typeof wp !== 'string' || wp.length === 0) {
+      ws.send(
+        JSON.stringify(
+          makeError(req, 'bad_request', 'payload requires { path: string }')
+        )
+      );
+      return;
+    }
+    try {
+      const settings = removeWorkspace(wp);
+      ws.send(JSON.stringify(makeOk(req, settings)));
+      broadcastWorkspacesUpdated();
+    } catch (err) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'settings_error',
+            (err && /** @type {any} */ (err).message) ||
+              'Failed to save settings'
+          )
+        )
+      );
+    }
+    return;
+  }
+
+  // settings-add-city: payload { config_path: string }
+  if (req.type === 'settings-add-city') {
+    const { config_path } = /** @type {any} */ (req.payload || {});
+    if (typeof config_path !== 'string' || config_path.length === 0) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'bad_request',
+            'payload requires { config_path: string }'
+          )
+        )
+      );
+      return;
+    }
+    try {
+      // Validate that the file exists and parses
+      const probe = loadAndEnumerate(config_path);
+      if (probe.error) {
+        ws.send(JSON.stringify(makeError(req, 'city_invalid', probe.error)));
+        return;
+      }
+      const settings = addCity({ config_path });
+      ws.send(
+        JSON.stringify(
+          makeOk(req, { settings, workspace_count: probe.workspaces.length })
+        )
+      );
+      broadcastWorkspacesUpdated();
+    } catch (err) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'settings_error',
+            (err && /** @type {any} */ (err).message) ||
+              'Failed to save settings'
+          )
+        )
+      );
+    }
+    return;
+  }
+
+  // settings-remove-city: payload { config_path: string }
+  if (req.type === 'settings-remove-city') {
+    const { config_path } = /** @type {any} */ (req.payload || {});
+    if (typeof config_path !== 'string' || config_path.length === 0) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'bad_request',
+            'payload requires { config_path: string }'
+          )
+        )
+      );
+      return;
+    }
+    try {
+      const settings = removeCity(config_path);
+      ws.send(JSON.stringify(makeOk(req, settings)));
+      broadcastWorkspacesUpdated();
+    } catch (err) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'settings_error',
+            (err && /** @type {any} */ (err).message) ||
+              'Failed to save settings'
+          )
+        )
+      );
+    }
+    return;
+  }
+
   // Unknown type
   const err = makeError(
     req,
@@ -1345,4 +1676,43 @@ export async function handleMessage(ws, data) {
     `Unknown message type: ${req.type}`
   );
   ws.send(JSON.stringify(err));
+}
+
+/**
+ * Public alias of `broadcastWorkspacesUpdated` so the multi-watcher and other
+ * server-side modules can trigger the same effect on external file changes.
+ */
+export function broadcastWorkspacesUpdatedExternal() {
+  broadcastWorkspacesUpdated();
+}
+
+/**
+ * Broadcast a `workspaces-updated` event to all clients, prompting them to
+ * reload the workspace list and re-subscribe. Also re-runs active list
+ * subscriptions so the fan-out picks up new/removed workspaces.
+ */
+function broadcastWorkspacesUpdated() {
+  const wss = CURRENT_WSS;
+  if (wss) {
+    const msg = JSON.stringify({
+      id: `evt-${Date.now()}`,
+      ok: true,
+      type: 'workspaces-updated',
+      payload: {}
+    });
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN) {
+        try {
+          ws.send(msg);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  try {
+    scheduleListRefresh();
+  } catch {
+    // ignore
+  }
 }

@@ -4,19 +4,56 @@ import { fetchListForSubscription } from './list-adapters.js';
 import { keyOf, registry } from './subscriptions.js';
 import { attachWsServer, handleMessage, scheduleListRefresh } from './ws.js';
 
-// Mock adapters BEFORE importing ws.js to ensure the mock is applied
-vi.mock('./list-adapters.js', () => ({
-  fetchListForSubscription: vi.fn(async () => {
-    // Return a simple, deterministic list for any spec
-    return {
-      ok: true,
-      items: [
-        { id: 'A', updated_at: 1, closed_at: null },
-        { id: 'B', updated_at: 1, closed_at: null }
-      ]
+// Mock adapters BEFORE importing ws.js to ensure the mock is applied.
+// fetchListForActiveWorkspaces is implemented in terms of
+// fetchListForSubscription, so the per-test mocks of the latter still drive
+// the outcomes here.
+vi.mock('./list-adapters.js', () => {
+  /** @type {any} */
+  const fetchListForSubscription = vi.fn(async () => ({
+    ok: true,
+    items: [
+      { id: 'A', updated_at: 1, closed_at: null },
+      { id: 'B', updated_at: 1, closed_at: null }
+    ]
+  }));
+  /**
+   * @param {any} _spec
+   * @param {any} [options]
+   */
+  const fetchListForActiveWorkspaces = async (_spec, options = {}) => {
+    const res = await fetchListForSubscription(_spec);
+    const ws = {
+      path: options.cwd || '/tmp/test-ws',
+      label: 'test-ws',
+      source: 'cwd'
     };
-  })
-}));
+    if (res && res.ok) {
+      for (const it of res.items) {
+        /** @type {any} */ (it)._workspace = { path: ws.path, label: ws.label };
+      }
+      return {
+        items: res.items,
+        results: [{ workspace: ws, ok: true, items: res.items }],
+        workspaces: [ws]
+      };
+    }
+    return {
+      items: [],
+      results: [{ workspace: ws, ok: false, error: res?.error }],
+      workspaces: [ws]
+    };
+  };
+  /**
+   * @param {any} items
+   */
+  const tagItemsWithWorkspace = (items) => items;
+  return {
+    fetchListForSubscription,
+    fetchListForActiveWorkspaces,
+    tagItemsWithWorkspace
+  };
+});
 
 describe('ws list subscriptions', () => {
   test('refresh emits upsert/delete after subscribe', async () => {

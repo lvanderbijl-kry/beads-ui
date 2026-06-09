@@ -3,17 +3,40 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { fetchListForSubscription } from './list-adapters.js';
 import { attachWsServer, handleMessage, scheduleListRefresh } from './ws.js';
 
-vi.mock('./list-adapters.js', () => ({
-  fetchListForSubscription: vi.fn(async () => {
-    return {
-      ok: true,
-      items: [
-        { id: 'A', updated_at: 1, closed_at: null },
-        { id: 'B', updated_at: 1, closed_at: null }
-      ]
+vi.mock('./list-adapters.js', () => {
+  /** @type {any} */
+  const fetchListForSubscription = vi.fn(async () => ({
+    ok: true,
+    items: [
+      { id: 'A', updated_at: 1, closed_at: null },
+      { id: 'B', updated_at: 1, closed_at: null }
+    ]
+  }));
+  /**
+   * @param {any} _spec
+   * @param {any} [options]
+   */
+  const fetchListForActiveWorkspaces = async (_spec, options = {}) => {
+    const res = await fetchListForSubscription(_spec);
+    const ws = {
+      path: options.cwd || '/tmp/test-ws',
+      label: 'test-ws',
+      source: 'cwd'
     };
-  })
-}));
+    return {
+      items: res.items,
+      results: [{ workspace: ws, ok: true, items: res.items }],
+      workspaces: [ws]
+    };
+  };
+  /** @param {any} items */
+  const tagItemsWithWorkspace = (items) => items;
+  return {
+    fetchListForSubscription,
+    fetchListForActiveWorkspaces,
+    tagItemsWithWorkspace
+  };
+});
 
 beforeEach(() => {
   vi.useFakeTimers();

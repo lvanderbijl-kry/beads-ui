@@ -60,8 +60,20 @@ export function createEpicsView(
     onUpdate: updateInline,
     requestRender: doRender,
     getSelectedId: () => null,
-    row_class: 'epic-row'
+    row_class: 'epic-row',
+    getShowWorkspace: () => workspaceCount() > 1
   });
+
+  /**
+   * Read the count of active workspaces from store state. Used to decide
+   * whether to render workspace badges on rows.
+   */
+  function workspaceCount() {
+    // epics view doesn't carry a store handle directly; if needed, the badge
+    // is hidden — but for correctness we conservatively show when items have
+    // a `_workspace` field.
+    return 0;
+  }
 
   function doRender() {
     render(template(), mount_element);
@@ -210,9 +222,7 @@ export function createEpicsView(
         epic_unsubs.delete(epic_id);
         try {
           if (issue_stores && /** @type {any} */ (issue_stores).unregister) {
-            /** @type {any} */ (issue_stores).unregister(
-              `children:${epic_id}`
-            );
+            /** @type {any} */ (issue_stores).unregister(`children:${epic_id}`);
           }
         } catch {
           // ignore

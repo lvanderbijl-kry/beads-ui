@@ -34,6 +34,7 @@
     "postpack": "rm app/main.bundle.js app/main.bundle.js.map"
   },
   "dependencies": {
+    "@iarna/toml": "^2.2.5",
     "debug": "^4.4.3",
     "dompurify": "^3.3.0",
     "express": "^5.2.1",
