@@ -54,6 +54,8 @@ export function createListView(
   let issues_cache = [];
   /** @type {string[]} */
   let type_filters = [];
+  /** @type {string[]} */
+  let workspace_filter = [];
   /** @type {string | null} */
   let selected_id = store ? store.getState().selected_id : null;
   /** @type {null | (() => void)} */
@@ -85,6 +87,19 @@ export function createListView(
     return [];
   }
 
+  /**
+   * Read the count of active workspaces from store state.
+   *
+   * @returns {number}
+   */
+  function workspaceCount() {
+    if (!store) return 0;
+    const s = store.getState();
+    return Array.isArray(s.workspace?.available)
+      ? s.workspace.available.length
+      : 0;
+  }
+
   // Shared row renderer (used in template below)
   const row_renderer = createIssueRowRenderer({
     navigate: (id) => {
@@ -96,7 +111,21 @@ export function createListView(
     onUpdate: updateInline,
     requestRender: doRender,
     getSelectedId: () => selected_id,
-    row_class: 'issue-row'
+    row_class: 'issue-row',
+    getShowWorkspace: () => workspaceCount() > 1,
+    getWorkspaceFilter: () => workspace_filter,
+    onWorkspaceClick: (workspace_path) => {
+      // Click toggles filter to that single workspace; click again to clear.
+      if (
+        workspace_filter.length === 1 &&
+        workspace_filter[0] === workspace_path
+      ) {
+        workspace_filter = [];
+      } else {
+        workspace_filter = [workspace_path];
+      }
+      void load();
+    }
   });
 
   /**
@@ -224,6 +253,12 @@ export function createListView(
       filtered = filtered.filter((it) =>
         type_filters.includes(String(it.issue_type || ''))
       );
+    }
+    if (workspace_filter.length > 0) {
+      filtered = filtered.filter((it) => {
+        const ws = /** @type {any} */ (it)._workspace;
+        return ws && workspace_filter.includes(String(ws.path));
+      });
     }
     // Sorting: closed list is a special case → sort by closed_at desc only
     if (status_filters.length === 1 && status_filters[0] === 'closed') {

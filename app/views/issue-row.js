@@ -6,7 +6,7 @@ import { statusLabel } from '../utils/status.js';
 import { createTypeBadge } from '../utils/type-badge.js';
 
 /**
- * @typedef {{ id: string, title?: string, status?: string, priority?: number, issue_type?: string, assignee?: string, dependency_count?: number, dependent_count?: number }} IssueRowData
+ * @typedef {{ id: string, title?: string, status?: string, priority?: number, issue_type?: string, assignee?: string, dependency_count?: number, dependent_count?: number, _workspace?: { path: string, label: string } }} IssueRowData
  */
 
 /**
@@ -18,7 +18,10 @@ import { createTypeBadge } from '../utils/type-badge.js';
  *   onUpdate: (id: string, patch: { title?: string, assignee?: string, status?: 'open'|'in_progress'|'closed', priority?: number }) => Promise<void>,
  *   requestRender: () => void,
  *   getSelectedId?: () => string | null,
- *   row_class?: string
+ *   row_class?: string,
+ *   getShowWorkspace?: () => boolean,
+ *   getWorkspaceFilter?: () => string[],
+ *   onWorkspaceClick?: (workspace_path: string) => void
  * }} options
  * @returns {(it: IssueRowData) => import('lit-html').TemplateResult<1>}
  */
@@ -28,6 +31,10 @@ export function createIssueRowRenderer(options) {
   const request_render = options.requestRender;
   const get_selected_id = options.getSelectedId || (() => null);
   const row_class = options.row_class || 'issue-row';
+  const get_show_workspace = options.getShowWorkspace || (() => false);
+  const _get_workspace_filter = options.getWorkspaceFilter || (() => []);
+  const on_workspace_click = options.onWorkspaceClick || (() => {});
+  void _get_workspace_filter;
 
   /** @type {Set<string>} */
   const editing = new Set();
@@ -149,7 +156,24 @@ export function createIssueRowRenderer(options) {
     >
       <td role="gridcell" class="mono">${createIssueIdRenderer(it.id)}</td>
       <td role="gridcell">${createTypeBadge(it.issue_type)}</td>
-      <td role="gridcell">${editableText(it.id, 'title', it.title || '')}</td>
+      <td role="gridcell">
+        ${get_show_workspace() && it._workspace
+          ? html`<button
+              type="button"
+              class="workspace-badge"
+              title=${`Workspace: ${it._workspace.path}`}
+              @click=${(/** @type {Event} */ ev) => {
+                ev.stopPropagation();
+                if (it._workspace) {
+                  on_workspace_click(it._workspace.path);
+                }
+              }}
+            >
+              ${it._workspace.label}
+            </button>`
+          : ''}
+        ${editableText(it.id, 'title', it.title || '')}
+      </td>
       <td role="gridcell">
         <select
           class="badge-select badge--status is-${cur_status}"

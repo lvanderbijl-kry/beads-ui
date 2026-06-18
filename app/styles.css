@@ -2118,3 +2118,122 @@ html[data-theme='dark'] {
 .dependent-count:hover {
   color: var(--fg);
 }
+
+/* --- Multi-workspace --- */
+.workspace-badge {
+  display: inline-block;
+  margin-right: var(--space-2);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  background: var(--panel-bg);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.workspace-badge:hover {
+  color: var(--fg);
+  border-color: var(--fg);
+}
+
+/* --- Empty state --- */
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  padding: var(--space-6);
+}
+.empty-state-content {
+  max-width: 520px;
+  text-align: center;
+}
+.empty-state-content h2 {
+  margin-top: 0;
+}
+.empty-state-content .btn {
+  margin-top: var(--space-4);
+  display: inline-block;
+}
+
+/* --- Settings page --- */
+.settings-page {
+  padding: var(--space-4);
+  max-width: 960px;
+  margin: 0 auto;
+}
+.settings-section {
+  margin-top: var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.settings-help {
+  color: var(--muted);
+  margin-top: 0;
+}
+.settings-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: var(--space-3) 0;
+}
+.settings-table th,
+.settings-table td {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.settings-form-row {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  align-items: center;
+}
+.settings-form-row input[type='text'] {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  color: var(--fg);
+}
+.source-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 9999px;
+  font-size: 11px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.source-chip.source-cwd {
+  color: var(--fg);
+}
+.source-chip.source-settings {
+  color: #2a73c4;
+  border-color: #2a73c4;
+}
+.source-chip.source-city {
+  color: #b14b00;
+  border-color: #b14b00;
+}
+.city-hint {
+  font-size: 10px;
+}
+.status-ok {
+  color: #2a8f3a;
+}
+.status-error {
+  color: #c73a3a;
+  cursor: help;
+}
+.validation-error {
+  color: #c73a3a;
+  margin-top: var(--space-3);
+}
+.btn-sm {
+  padding: 2px 8px;
+  font-size: 12px;
+}

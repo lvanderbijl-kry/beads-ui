@@ -4,9 +4,10 @@ import { printServerUrl } from './cli/daemon.js';
 import { getConfig } from './config.js';
 import { resolveWorkspaceDatabase } from './db.js';
 import { debug, enableAllDebug } from './logging.js';
+import { createMultiWatcher } from './multi-watcher.js';
 import { registerWorkspace, watchRegistry } from './registry-watcher.js';
 import { watchDb } from './watcher.js';
-import { attachWsServer } from './ws.js';
+import { attachWsServer, broadcastWorkspacesUpdatedExternal } from './ws.js';
 
 if (process.argv.includes('--debug') || process.argv.includes('-d')) {
   enableAllDebug();
@@ -53,6 +54,23 @@ const { scheduleListRefresh } = attachWsServer(server, {
   root_dir: config.root_dir,
   watcher: db_watcher
 });
+
+// Watch every active workspace's .beads/ dir plus every configured city.toml
+// for changes. Beads changes schedule a subscription refresh; city.toml
+// changes broadcast workspaces-updated so the UI re-resolves.
+const multi_watcher = createMultiWatcher({
+  cwd: config.root_dir,
+  onBeadsChange: () => {
+    log('multi-watcher: beads change → refresh');
+    scheduleListRefresh();
+  },
+  onCityChange: () => {
+    log('multi-watcher: city/settings change → workspaces-updated');
+    broadcastWorkspacesUpdatedExternal();
+    multi_watcher.rebind();
+  }
+});
+multi_watcher;
 
 // Watch the global registry for workspace changes (e.g., when user starts
 // bd daemon in a different project). This enables automatic workspace switching.

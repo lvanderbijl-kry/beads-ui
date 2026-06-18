@@ -12,7 +12,7 @@ import { debug } from './utils/logging.js';
  */
 
 /**
- * @typedef {'issues'|'epics'|'board'} ViewName
+ * @typedef {'issues'|'epics'|'board'|'settings'} ViewName
  */
 
 /**
@@ -35,6 +35,7 @@ import { debug } from './utils/logging.js';
  * @typedef {Object} WorkspaceState
  * @property {WorkspaceInfo | null} current - Currently active workspace
  * @property {WorkspaceInfo[]} available - All available workspaces
+ * @property {boolean} loaded - True once the server's workspace list has been received
  */
 
 /**
@@ -69,7 +70,8 @@ export function createStore(initial = {}) {
     },
     workspace: {
       current: initial.workspace?.current ?? null,
-      available: initial.workspace?.available ?? []
+      available: initial.workspace?.available ?? [],
+      loaded: initial.workspace?.loaded ?? false
     }
   };
 
@@ -110,13 +112,18 @@ export function createStore(initial = {}) {
           available:
             patch.workspace?.available !== undefined
               ? patch.workspace.available
-              : state.workspace.available
+              : state.workspace.available,
+          loaded:
+            patch.workspace?.loaded !== undefined
+              ? patch.workspace.loaded
+              : state.workspace.loaded
         }
       };
       // Avoid emitting if nothing changed (shallow compare)
       const workspace_changed =
         next.workspace.current?.path !== state.workspace.current?.path ||
-        next.workspace.available.length !== state.workspace.available.length;
+        next.workspace.available.length !== state.workspace.available.length ||
+        next.workspace.loaded !== state.workspace.loaded;
       if (
         next.selected_id === state.selected_id &&
         next.view === state.view &&
